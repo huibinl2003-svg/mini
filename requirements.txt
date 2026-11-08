@@ -1,0 +1,7 @@
+# 本地离线打包用到的库
+# 只写你程序真正用到的库，不要联网调用的库
+# 比如用 openpyxl 处理 Excel、python-docx 处理 Word，就写在这里
+# 示例程序只用 tkinter（Python 自带），所以这里留空也可以
+
+# openpyxl
+# python-docx
