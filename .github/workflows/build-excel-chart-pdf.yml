@@ -1,0 +1,30 @@
+# 用 GitHub Actions 在 Windows 上把 excel_chart_to_pdf.py 打包成 exe
+name: Build Excel Chart to PDF exe
+on:
+  push:
+    paths:
+      - 'excel_chart_to_pdf.py'
+      - '.github/workflows/build-excel-chart-pdf.yml'
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pywin32 pypdf pyinstaller
+      - name: Build exe with PyInstaller
+        run: |
+          pyinstaller --onefile --windowed --name ExcelChartToPDF --hidden-import win32com.client excel_chart_to_pdf.py
+      - name: Upload exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: ExcelChartToPDF-windows
+          path: dist/ExcelChartToPDF.exe
