@@ -5,13 +5,22 @@ Excel 图表批量导出 PDF 工具
 功能：
   * 选择一个 .xlsx / .xlsm 文件
   * 直接读取文件中所有 Sheet 的图表（柱状图、折线图等）
+  * 只导出图表本身，不要数据表、不要单元格
   * 每个图表单独占 PDF 一页，按 Sheet 顺序排列
   * A4 横向，图表居中放大，打印清晰
-  * 调用本机 Microsoft Excel 渲染（样式、图例、数据表与原文件一致）
+  * 调用本机 Microsoft Excel 渲染（标题、图例、坐标轴、数据标签、颜色、字体与原文件一致）
   * 不修改原始 Excel 文件，不联网
 
+做法：
+  * 导出前先把图表自带的数据表关掉（HasDataTable=False），再用 CopyPicture
+    （xlPrinter，高清）把图表复制为图片，粘贴到临时工作簿的一张表上，
+    临时表设为 A4 横向、居中、一页，最后整本导出为一个 PDF。
+  * 这样 PDF 里只有图表，没有数据表，也没有单元格内容；页是 A4 横向。
+  * 不用 Chart.ExportAsFixedFormat 直接导出图表——实测它会把整个工作表
+    （含单元格）都导出来，页数和纸张都不对。
+
 运行环境：Windows + Python 3 + Microsoft Excel
-依赖：pywin32、pypdf（只需装一次：pip install pywin32 pypdf）
+依赖：pywin32（只需装一次：pip install pywin32）
 界面：tkinter（Python 自带）
 
 用法：双击运行本文件，或 python excel_chart_to_pdf.py
@@ -20,7 +29,6 @@ Excel 图表批量导出 PDF 工具
 import os
 import sys
 import queue
-import tempfile
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -30,6 +38,8 @@ XL_PAPER_A4 = 9            # A4
 XL_LANDSCAPE = 2           # 横向
 XL_TYPE_PDF = 0            # xlTypePDF
 XL_QUALITY_STANDARD = 0    # 标准质量
+XL_PRINTER = 2             # CopyPicture Appearance:=xlPrinter（高清）
+XL_PICTURE = -4147         # CopyPicture Format:=xlPicture
 
 # A4 横向可用区域（单位：点 pt；1cm = 28.35pt）
 # A4 横向 29.7cm x 21cm，上下左右各留 1cm 边距
@@ -40,10 +50,10 @@ MARGIN_PT = 28.35  # 1cm
 
 
 # ------------------------------------------------------------------
-# 核心导出逻辑（调用本机 Excel，直接导出每个图表再合并）
+# 核心导出逻辑（调用本机 Excel）
 # ------------------------------------------------------------------
 def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
-    """把文件中所有 Sheet 的图表导出为一个 PDF（按 Sheet 顺序）。
+    """把文件中所有 Sheet 的图表导出为一个 PDF（按 Sheet 顺序，只含图表）。
 
     参数：
         excel_path : Excel 文件完整路径
@@ -62,14 +72,6 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
             "    pip install pywin32\n"
             "装好后重新运行本工具。"
         )
-    try:
-        from pypdf import PdfReader, PdfWriter
-    except ImportError:
-        raise RuntimeError(
-            "缺少 pypdf，请先安装一次：\n"
-            "    pip install pypdf\n"
-            "装好后重新运行本工具。"
-        )
 
     if not os.path.isfile(excel_path):
         raise FileNotFoundError("找不到文件：\n" + excel_path)
@@ -84,8 +86,7 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
 
     excel = None
     wb = None
-    tmpdir = tempfile.mkdtemp(prefix="excel_charts_")
-    tmp_pdfs = []
+    temp_wb = None
     try:
         # 用一个独立的 Excel 进程，不干扰用户已打开的 Excel
         excel = win32.DispatchEx("Excel.Application")
@@ -114,6 +115,11 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
         if not jobs:
             raise ValueError("文件中没有找到任何图表，无法导出。")
 
+        # ---- 创建临时工作簿（只放图表图片，每张表一个图表）----
+        temp_wb = excel.Workbooks.Add()
+        while temp_wb.Worksheets.Count > 1:
+            temp_wb.Worksheets(temp_wb.Worksheets.Count).Delete()
+
         total = len(jobs)
         for n, (sheet_name, co) in enumerate(jobs, 1):
             title = ""
@@ -131,60 +137,79 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
             if progress_cb:
                 progress_cb(n - 1, total, "正在处理：%s" % label)
 
-            # 临时放大图表到填满 A4 横向（保持比例），导出完恢复
-            ow = float(co.Width)
-            oh = float(co.Height)
-            scaled = False
-            if ow > 0 and oh > 0:
-                scale = min(PAGE_W / ow, PAGE_H / oh)
-                if scale > 1:
-                    co.Width = ow * scale
-                    co.Height = oh * scale
-                    scaled = True
+            if n == 1:
+                tws = temp_wb.Worksheets(1)
+            else:
+                tws = temp_wb.Worksheets.Add(
+                    After=temp_wb.Worksheets(temp_wb.Worksheets.Count))
+            tws.Name = "Chart_%d" % n
 
-            # 图表页面设置：A4 横向，1cm 边距，居中，一页
+            # 页面设置：A4 横向，1cm 边距，居中，一页
+            ps = tws.PageSetup
+            ps.PaperSize = XL_PAPER_A4
+            ps.Orientation = XL_LANDSCAPE
+            ps.LeftMargin = MARGIN_PT
+            ps.RightMargin = MARGIN_PT
+            ps.TopMargin = MARGIN_PT
+            ps.BottomMargin = MARGIN_PT
+            ps.HeaderMargin = 0
+            ps.FooterMargin = 0
+            ps.CenterHorizontally = True
+            ps.CenterVertically = True
+            ps.Zoom = False
+            ps.FitToPagesWide = 1
+            ps.FitToPagesTall = 1
+
+            # 关掉图表自带的数据表（只要图表，不要表格），再高清复制为图片
+            cht = co.Chart
+            hadTable = False
             try:
-                ps = co.Chart.PageSetup
-                ps.PaperSize = XL_PAPER_A4
-                ps.Orientation = XL_LANDSCAPE
-                ps.LeftMargin = MARGIN_PT
-                ps.RightMargin = MARGIN_PT
-                ps.TopMargin = MARGIN_PT
-                ps.BottomMargin = MARGIN_PT
-                ps.HeaderMargin = 0
-                ps.FooterMargin = 0
-                ps.CenterHorizontally = True
-                ps.CenterVertically = True
-                ps.Zoom = False
-                ps.FitToPagesWide = 1
-                ps.FitToPagesTall = 1
+                hadTable = cht.HasDataTable
+            except Exception:
+                hadTable = False
+            try:
+                cht.HasDataTable = False
+            except Exception:
+                pass
+            co.CopyPicture(Appearance=XL_PRINTER, Format=XL_PICTURE)
+            # 立刻恢复数据表开关（源文件是只读打开的，本来也不会保存）
+            try:
+                cht.HasDataTable = hadTable
             except Exception:
                 pass
 
-            # 直接导出这一个图表为一页 PDF（Excel 原生渲染，数据表格式正确）
-            tmp_pdf = os.path.join(tmpdir, "chart_%02d.pdf" % n)
-            co.Chart.ExportAsFixedFormat(
-                Type=XL_TYPE_PDF,
-                Filename=tmp_pdf,
-                Quality=XL_QUALITY_STANDARD,
-                IncludeDocProperties=False,
-                IgnorePrintAreas=False,
-                OpenAfterPublish=False,
-            )
-            tmp_pdfs.append(tmp_pdf)
-
-            # 恢复图表原始大小（源文件是只读打开的，本来也不会保存）
-            if scaled:
+            # 粘贴图片到临时表，放大到填满可用区域并居中
+            tws.Activate()
+            tws.Paste()
+            shapes = tws.Shapes
+            pic = shapes.Item(shapes.Count)
+            ow = float(pic.Width)
+            oh = float(pic.Height)
+            if ow > 0 and oh > 0:
+                scale = min(PAGE_W / ow, PAGE_H / oh)
+                nw = ow * scale
+                nh = oh * scale
                 try:
-                    co.Width = ow
-                    co.Height = oh
+                    pic.LockAspectRatio = 0  # msoFalse
                 except Exception:
                     pass
+                pic.Width = nw
+                pic.Height = nh
+                pic.Left = MARGIN_PT + (PAGE_W - nw) / 2.0
+                pic.Top = MARGIN_PT + (PAGE_H - nh) / 2.0
+
+            # 打印区域只框图片所在范围，保证一页一个图表
+            try:
+                tl = pic.TopLeftCell
+                br = pic.BottomRightCell
+                ps.PrintArea = "%s:%s" % (tl.Address, br.Address)
+            except Exception:
+                pass
 
             if progress_cb:
                 progress_cb(n, total, "已完成：%s" % label)
 
-        # ---- 合并成一个 PDF ----
+        # ---- 导出整个临时工作簿为一个 PDF（每张临时表 = 一页）----
         if os.path.exists(pdf_path):
             try:
                 os.remove(pdf_path)
@@ -194,13 +219,14 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
                     "可能它正被 PDF 阅读器打开着，请关闭后重试。" % pdf_path
                 )
 
-        writer = PdfWriter()
-        for tmp_pdf in tmp_pdfs:
-            reader = PdfReader(tmp_pdf)
-            for page in reader.pages:
-                writer.add_page(page)
-        with open(pdf_path, "wb") as f:
-            writer.write(f)
+        temp_wb.ExportAsFixedFormat(
+            Type=XL_TYPE_PDF,
+            Filename=pdf_path,
+            Quality=XL_QUALITY_STANDARD,
+            IncludeDocProperties=True,
+            IgnorePrintAreas=False,
+            OpenAfterPublish=False,
+        )
 
         if not os.path.isfile(pdf_path):
             raise RuntimeError("PDF 未生成，未知原因。请检查 Excel 是否正常。")
@@ -208,19 +234,12 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
         return pdf_path, []
 
     finally:
-        # 清理临时 PDF
-        for tmp_pdf in tmp_pdfs:
-            try:
-                if os.path.exists(tmp_pdf):
-                    os.remove(tmp_pdf)
-            except Exception:
-                pass
+        # 清理：先关临时工作簿，再关源文件，最后退出 Excel
         try:
-            if tmpdir and os.path.isdir(tmpdir):
-                os.rmdir(tmpdir)
+            if temp_wb is not None:
+                temp_wb.Close(SaveChanges=False)
         except Exception:
             pass
-        # 关闭 Excel（源文件只读打开，不保存）
         try:
             if wb is not None:
                 wb.Close(SaveChanges=False)
@@ -271,7 +290,7 @@ class App:
         frm_info.pack(fill="x")
         ttk.Label(
             frm_info,
-            text="导出文件中所有 Sheet 的图表，按 Sheet 顺序排列，每个图表单独占一页。",
+            text="只导出文件中所有 Sheet 的图表（不要数据表、不要单元格），按 Sheet 顺序排列，每个图表单独占一页。",
             foreground="#666666",
             wraplength=520,
             justify="left",
