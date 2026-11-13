@@ -11,13 +11,16 @@ Excel 图表批量导出 PDF 工具
   * 调用本机 Microsoft Excel 渲染（标题、图例、坐标轴、数据标签、颜色、字体与原文件一致）
   * 不修改原始 Excel 文件，不联网
 
-做法：
+做法（与之前能正常出 PDF 的 VBA 宏同样的版式）：
+  * 临时表按固定版式：A:AZ 列宽 2，1:40 行高 15，打印区域固定为 $A$1:$AZ$40，
+    A4 横向、1cm 边距、居中、一页；图片拉满整个打印区域。
   * 导出前先把图表自带的数据表关掉（HasDataTable=False），再用 CopyPicture
-    （xlPrinter，高清）把图表复制为图片，粘贴到临时工作簿的一张表上，
-    临时表设为 A4 横向、居中、一页，最后整本导出为一个 PDF。
+    （xlPrinter，高清）把图表复制为图片，粘贴到临时表。
   * 这样 PDF 里只有图表，没有数据表，也没有单元格内容；页是 A4 横向。
   * 不用 Chart.ExportAsFixedFormat 直接导出图表——实测它会把整个工作表
     （含单元格）都导出来，页数和纸张都不对。
+  * 打印区域不用 TopLeftCell/BottomRightCell 现算（可能算出过大范围导致
+    导出失败），改用 VBA 宏验证过的固定区域。
 
 运行环境：Windows + Python 3 + Microsoft Excel
 依赖：pywin32（只需装一次：pip install pywin32）
@@ -41,12 +44,8 @@ XL_QUALITY_STANDARD = 0    # 标准质量
 XL_PRINTER = 2             # CopyPicture Appearance:=xlPrinter（高清）
 XL_PICTURE = -4147         # CopyPicture Format:=xlPicture
 
-# A4 横向可用区域（单位：点 pt；1cm = 28.35pt）
-# A4 横向 29.7cm x 21cm，上下左右各留 1cm 边距
-# 可用宽 = 27.7cm = 785pt，可用高 = 19cm = 539pt
-PAGE_W = 785.0
-PAGE_H = 539.0
-MARGIN_PT = 28.35  # 1cm
+MARGIN_PT = 28.35  # 1cm = 28.35pt
+PRINT_AREA = "$A$1:$AZ$40"
 
 
 # ------------------------------------------------------------------
@@ -144,6 +143,10 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
                     After=temp_wb.Worksheets(temp_wb.Worksheets.Count))
             tws.Name = "Chart_%d" % n
 
+            # 固定版式：A:AZ 列宽 2，1:40 行高 15
+            tws.Range("A:AZ").ColumnWidth = 2
+            tws.Range("1:40").RowHeight = 15
+
             # 页面设置：A4 横向，1cm 边距，居中，一页
             ps = tws.PageSetup
             ps.PaperSize = XL_PAPER_A4
@@ -159,6 +162,7 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
             ps.Zoom = False
             ps.FitToPagesWide = 1
             ps.FitToPagesTall = 1
+            ps.PrintArea = PRINT_AREA
 
             # 关掉图表自带的数据表（只要图表，不要表格），再高清复制为图片
             cht = co.Chart
@@ -178,33 +182,20 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
             except Exception:
                 pass
 
-            # 粘贴图片到临时表，放大到填满可用区域并居中
+            # 粘贴图片到临时表，拉满整个打印区域
             tws.Activate()
             tws.Paste()
             shapes = tws.Shapes
             pic = shapes.Item(shapes.Count)
-            ow = float(pic.Width)
-            oh = float(pic.Height)
-            if ow > 0 and oh > 0:
-                scale = min(PAGE_W / ow, PAGE_H / oh)
-                nw = ow * scale
-                nh = oh * scale
-                try:
-                    pic.LockAspectRatio = 0  # msoFalse
-                except Exception:
-                    pass
-                pic.Width = nw
-                pic.Height = nh
-                pic.Left = MARGIN_PT + (PAGE_W - nw) / 2.0
-                pic.Top = MARGIN_PT + (PAGE_H - nh) / 2.0
-
-            # 打印区域只框图片所在范围，保证一页一个图表
+            area = tws.Range(PRINT_AREA)
             try:
-                tl = pic.TopLeftCell
-                br = pic.BottomRightCell
-                ps.PrintArea = "%s:%s" % (tl.Address, br.Address)
+                pic.LockAspectRatio = 0  # msoFalse
             except Exception:
                 pass
+            pic.Left = 0
+            pic.Top = 0
+            pic.Width = float(area.Width)
+            pic.Height = float(area.Height)
 
             if progress_cb:
                 progress_cb(n, total, "已完成：%s" % label)
@@ -219,6 +210,7 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
                     "可能它正被 PDF 阅读器打开着，请关闭后重试。" % pdf_path
                 )
 
+        temp_wb.Worksheets.Select()
         temp_wb.ExportAsFixedFormat(
             Type=XL_TYPE_PDF,
             Filename=pdf_path,
