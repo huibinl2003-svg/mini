@@ -207,9 +207,14 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
             iw, ih = img.getSize()
             if iw <= 0 or ih <= 0:
                 continue
-            # 拉伸铺满整个可用区域（和原来 VBA 宏一样占满整页，不留白边）
-            c.drawImage(img, MARGIN_PT, MARGIN_PT, width=PAGE_W, height=PAGE_H,
-                        preserveAspectRatio=False, mask="auto")
+            # 按原比例放大到填满可用区域并居中，绝不拉伸变形
+            scale = min(PAGE_W / iw, PAGE_H / ih)
+            dw = iw * scale
+            dh = ih * scale
+            x = MARGIN_PT + (PAGE_W - dw) / 2.0
+            y = MARGIN_PT + (PAGE_H - dh) / 2.0
+            c.drawImage(img, x, y, width=dw, height=dh,
+                        preserveAspectRatio=True, mask="auto")
             c.showPage()
         c.save()
 
