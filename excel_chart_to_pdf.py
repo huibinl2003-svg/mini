@@ -5,9 +5,10 @@ Excel 图表批量导出 PDF 工具
 功能：
   * 选择一个 .xlsx / .xlsm 文件
   * 直接读取文件中所有 Sheet 的图表（柱状图、折线图等）
-  * 只导出图表本身，不要数据表、不要单元格
+  * 导出整个图表：图 + 图表自带的数据表 + 图例，一个都不少；
+    但不要工作表的单元格（不要表格）
   * 每个图表单独占 PDF 一页，按 Sheet 顺序排列
-  * A4 横向，图表居中放大，打印清晰
+  * A4 横向，图表拉伸铺满整页，打印清晰
   * 调用本机 Microsoft Excel 渲染图表（标题、图例、坐标轴、数据标签、颜色、字体与原文件一致）
   * 不修改原始 Excel 文件，不联网
 
@@ -15,9 +16,10 @@ Excel 图表批量导出 PDF 工具
   * 不用 Excel 自带的 PDF 导出（实测 Workbook.ExportAsFixedFormat 在 COM
     调用下反复报“无法保存该文档”；Chart.ExportAsFixedFormat 则会把整个
     工作表含单元格都导出来）。
-  * 导出前先把图表自带的数据表关掉（HasDataTable=False），再用
-    Chart.Export 把图表单独存为高清 PNG 图片（不含数据表、不含单元格），
-    最后用 reportlab 把图片拼成一个 PDF，每张图一页、A4 横向、居中放大。
+  * 用 Chart.Export 把图表单独存为高清 PNG 图片（图表 + 自带的数据表，
+    不含工作表单元格），再用 reportlab 把图片拼成 PDF，每张图一页、
+    A4 横向、拉伸铺满整页。Chart.Export 是按屏幕显示渲染的，数据表里
+    的数字按原格式显示（比如 21.0，不会变成 21.0072212）。
 
 运行环境：Windows + Python 3 + Microsoft Excel
 依赖：pywin32、reportlab、windnd（只需装一次：pip install pywin32 reportlab windnd）
@@ -150,16 +152,9 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
 
             cht = co.Chart
 
-            # 关掉图表自带的数据表（只要图表，不要表格）
-            hadTable = False
-            try:
-                hadTable = cht.HasDataTable
-            except Exception:
-                hadTable = False
-            try:
-                cht.HasDataTable = False
-            except Exception:
-                pass
+            # 数据表是图表的一部分，要一起导出（不要关掉）
+            # 注意：这里不用 CopyPicture，Chart.Export 是按屏幕显示渲染的，
+            # 数据表里的数字会按原格式显示（比如 21.0，不会变成 21.0072212）
 
             # 临时放大图表，保证导出的 PNG 够清晰，导出完恢复
             ow = float(co.Width)
@@ -173,7 +168,7 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
                 co.Height = nh
                 scaled = True
 
-            # 把图表单独存为 PNG（只含图表，不含数据表、不含单元格）
+            # 把图表单独存为 PNG（图表 + 自带的数据表，不含工作表单元格）
             png_path = os.path.join(tmpdir, "chart_%02d.png" % n)
             try:
                 cht.Export(png_path, "PNG")
@@ -183,17 +178,13 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
                 )
             pngs.append(png_path)
 
-            # 恢复图表原始大小和数据表开关（源文件是只读打开的，本来也不会保存）
+            # 恢复图表原始大小（源文件是只读打开的，本来也不会保存）
             if scaled:
                 try:
                     co.Width = ow
                     co.Height = oh
                 except Exception:
                     pass
-            try:
-                cht.HasDataTable = hadTable
-            except Exception:
-                pass
 
             if progress_cb:
                 progress_cb(n, total, "已完成：%s" % label)
