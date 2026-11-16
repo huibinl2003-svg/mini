@@ -20,10 +20,12 @@ Excel 图表批量导出 PDF 工具
     最后用 reportlab 把图片拼成一个 PDF，每张图一页、A4 横向、居中放大。
 
 运行环境：Windows + Python 3 + Microsoft Excel
-依赖：pywin32、reportlab（只需装一次：pip install pywin32 reportlab）
+依赖：pywin32、reportlab、windnd（只需装一次：pip install pywin32 reportlab windnd）
 界面：tkinter（Python 自带）
 
 用法：双击运行本文件，或 python excel_chart_to_pdf.py
+选文件方式：点「浏览…」，或直接把 Excel 文件拖到本窗口里（拖进来就自动开始导出）；
+也可以把 Excel 文件拖到 exe 图标上启动，会自动载入并导出。
 """
 
 import os
@@ -33,6 +35,13 @@ import tempfile
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+
+try:
+    import windnd  # Windows 拖放支持（拖文件进窗口）
+except ImportError:
+    windnd = None
+
+EXCEL_EXTS = (".xlsx", ".xlsm", ".xls")
 
 # A4 横向可用区域（单位：点 pt；1cm = 28.35pt）
 # A4 横向 29.7cm x 21cm，上下左右各留 1cm 边距
@@ -83,7 +92,7 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
         raise FileNotFoundError("找不到文件：\n" + excel_path)
 
     ext = os.path.splitext(excel_path)[1].lower()
-    if ext not in (".xlsx", ".xlsm", ".xls"):
+    if ext not in EXCEL_EXTS:
         raise ValueError(
             "不支持的文件格式：%s\n仅支持 .xlsx / .xlsm / .xls" % ext
         )
@@ -207,14 +216,9 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
             iw, ih = img.getSize()
             if iw <= 0 or ih <= 0:
                 continue
-            # 按比例放大到填满可用区域并居中
-            scale = min(PAGE_W / iw, PAGE_H / ih)
-            dw = iw * scale
-            dh = ih * scale
-            x = MARGIN_PT + (PAGE_W - dw) / 2.0
-            y = MARGIN_PT + (PAGE_H - dh) / 2.0
-            c.drawImage(img, x, y, width=dw, height=dh,
-                        preserveAspectRatio=True, mask="auto")
+            # 拉伸铺满整个可用区域（和原来 VBA 宏一样占满整页，不留白边）
+            c.drawImage(img, MARGIN_PT, MARGIN_PT, width=PAGE_W, height=PAGE_H,
+                        preserveAspectRatio=False, mask="auto")
             c.showPage()
         c.save()
 
@@ -292,6 +296,14 @@ class App:
             wraplength=520,
             justify="left",
         ).pack(anchor="w")
+        self.drop_hint = ttk.Label(
+            frm_info,
+            text="也可以把 Excel 文件直接拖到这个窗口里，松手就自动导出。",
+            foreground="#2B4FD9",
+            wraplength=520,
+            justify="left",
+        )
+        self.drop_hint.pack(anchor="w")
 
         # --- 导出按钮 + 进度 ---
         frm_run = ttk.Frame(root, padding=10)
@@ -310,6 +322,19 @@ class App:
         self.log = tk.Text(frm_log, height=5, state="disabled")
         self.log.pack(fill="both", expand=True)
 
+        # --- 拖入文件支持（windnd）---
+        if windnd is not None:
+            try:
+                windnd.hook_dropfiles(self.root, self._on_drop_raw)
+            except Exception:
+                self.drop_hint.configure(
+                    text="拖放功能不可用（windnd 加载失败），请用「浏览…」选文件。",
+                    foreground="#999999")
+        else:
+            self.drop_hint.configure(
+                text="拖放功能不可用（缺少 windnd），请用「浏览…」选文件；要启用拖放请装一次：pip install windnd。",
+                foreground="#999999")
+
     # -- 小工具 --
     def append_log(self, text):
         self.log.configure(state="normal")
@@ -326,6 +351,41 @@ class App:
         if path:
             self.file_var.set(path)
             self.status_var.set("已选择：%s" % os.path.basename(path))
+
+    # -- 拖入文件 --
+    def _on_drop_raw(self, paths):
+        # windnd 在窗口消息里回调，用 after 回到 tkinter 主循环再处理，避免重入
+        self.root.after(0, lambda: self._handle_drop(paths))
+
+    def _handle_drop(self, paths):
+        if self.exporting:
+            self.append_log("正在导出，刚才拖入的文件已忽略，请等这次导完再拖。")
+            return
+        if not paths:
+            return
+        # 只取第一个 Excel 文件；多拖了就提示一声
+        excel_path = None
+        for p in paths:
+            if os.path.isfile(p) and os.path.splitext(p)[1].lower() in EXCEL_EXTS:
+                excel_path = p
+                break
+        if excel_path is None:
+            messagebox.showwarning(
+                "不是 Excel 文件",
+                "拖入的文件里没有 .xlsx / .xlsm / .xls，请拖 Excel 文件。")
+            return
+        if len(paths) > 1:
+            self.append_log("拖入了 %d 个文件，只处理第一个 Excel 文件：%s"
+                            % (len(paths), os.path.basename(excel_path)))
+        self.load_file(excel_path, auto_start=True)
+
+    def load_file(self, path, auto_start=False):
+        """填入一个文件路径；auto_start 为真时直接开始导出。"""
+        self.file_var.set(path)
+        self.status_var.set("已选择：%s" % os.path.basename(path))
+        self.append_log("已载入：%s" % path)
+        if auto_start:
+            self.start_export()
 
     # -- 导出流程（后台线程 + 队列回主线程更新界面）--
     def start_export(self):
@@ -414,7 +474,14 @@ class App:
 
 def main():
     root = tk.Tk()
-    App(root)
+    app = App(root)
+    # 把 Excel 文件拖到 exe 图标上启动时，Windows 会把文件路径当作命令行参数传进来
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
+        if os.path.isfile(arg) and os.path.splitext(arg)[1].lower() in EXCEL_EXTS:
+            app.load_file(arg, auto_start=True)
+        else:
+            app.append_log("启动参数不是 Excel 文件，已忽略：%s" % arg)
     root.mainloop()
 
 
