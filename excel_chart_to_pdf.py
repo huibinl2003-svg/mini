@@ -18,17 +18,19 @@ Excel 图表批量导出 PDF 工具
   * 之前 v5–v13 用的是 Chart.Export 存 PNG 图片，那是点阵图，只有屏幕
     分辨率（约 96 DPI），放大到 A4 就糊；事后用 PIL 放大像素也补不回
     真正的细节，只能让边缘稍微平滑一点。
-  * v14 改成和 Excel 原生打印一样的做法：把每个图表（活的图表，不是图片）
-    复制到一个临时工作簿里，一图一页，用页面缩放（PageSetup.Zoom）把它
-    放大到填满 A4，再用 Excel 自带的 ExportAsFixedFormat 导出 PDF。
-    这样导出的 PDF 里图表是矢量图，和原生打印一样清楚，放大也不糊。
-    关键：全程不改图表对象的尺寸（v5–v12 试过了，改尺寸都会变形），
-    放大靠打印时的页面缩放来做，比例一定是对的。
-  * 万一矢量导出失败（比如 Excel 版本不支持），自动退回 v13 的 PNG
-    办法，至少还能出一份 PDF，不会报错退出。
+  * v15 的主办法（直接矢量导出）：每个图表直接调 Chart.ExportAsFixedFormat
+    导成一个矢量 PDF，再用 pypdf 把它们拼到 A4 横向页面上、合成一个 PDF。
+    拼的时候还是矢量，不会糊，和原生打印一样清楚。不用临时工作簿、
+    不用剪贴板、没有外部链接。关键：全程不改图表对象的尺寸（v5–v12
+    试过了，改尺寸都会变形），放大靠合并时的缩放来做，比例一定是对的。
+  * v14 的临时工作簿办法留着当第二选择；万一两条矢量路都失败，自动退回
+    v13 的 PNG 办法，至少还能出一份 PDF，不会报错退出。
+  * 走的是哪条路会明明白白显示在状态栏里：如果退回图片方式，会弹框提醒，
+    不会让用户拿着糊图还以为是矢量。
 
 运行环境：Windows + Python 3 + Microsoft Excel
-依赖：pywin32、reportlab、pillow（只需装一次：pip install pywin32 reportlab pillow）
+依赖：pywin32、reportlab、pillow、pypdf（只需装一次：
+  pip install pywin32 reportlab pillow pypdf）
 界面：tkinter（Python 自带）
 
 用法：双击运行本文件，或 python excel_chart_to_pdf.py
@@ -45,7 +47,7 @@ from tkinter import filedialog, messagebox, ttk
 
 EXCEL_EXTS = (".xlsx", ".xlsm", ".xls")
 
-VERSION = "v14"
+VERSION = "v15"
 
 # A4 横向可用区域（单位：点 pt；1cm = 28.35pt）
 # A4 横向 29.7cm x 21cm，上下左右各留 1cm 边距
@@ -95,13 +97,105 @@ def _hide_chart_border(cht):
             pass
 
 
-def _export_vector(excel, wb_src, jobs, pdf_path,
-                   progress_cb=None, log_cb=None):
-    """矢量导出：把活图表复制到临时工作簿，用页面缩放填满 A4，
-    再用 Excel 自带的 ExportAsFixedFormat 导出矢量 PDF。
+def _remove_old_pdf(pdf_path):
+    """旧 PDF 先删掉，避免覆盖失败。"""
+    if os.path.exists(pdf_path):
+        try:
+            os.remove(pdf_path)
+        except OSError:
+            raise RuntimeError(
+                "无法覆盖旧的 PDF：\n%s\n"
+                "可能它正被 PDF 阅读器打开着，请关闭后重试。" % pdf_path
+            )
+
+
+def _export_vector_direct(excel, wb_src, jobs, pdf_path, tmpdir,
+                          progress_cb=None, log_cb=None):
+    """直接矢量导出（主办法）：每个图表直接导成矢量 PDF，
+    再用 pypdf 把它们拼到 A4 横向页面上、合成一个 PDF。
+
+    不用临时工作簿、不用剪贴板、没有外部链接。
+    全程不改图表对象尺寸，放大靠合并时的缩放，比例不会变形。
+    成功返回 None；失败抛异常。
+    """
+    try:
+        from pypdf import PdfReader, PdfWriter, Transformation
+        from reportlab.lib.pagesizes import A4, landscape
+    except ImportError as e:
+        raise RuntimeError("缺少 pypdf 或 reportlab：%s" % e)
+
+    total = len(jobs)
+    chart_pdfs = []
+    try:
+        for n, (sheet_name, co) in enumerate(jobs, 1):
+            label = _chart_label(n, total, sheet_name, co)
+            if log_cb:
+                log_cb(label)
+            if progress_cb:
+                progress_cb(n - 1, total, "正在处理：%s" % label)
+
+            cht = co.Chart
+            # 数据表是图表的一部分，跟着图表一起导出；
+            # 数据表数字按原格式显示（比如 21.0，不会变成 21.0072212）
+            _hide_chart_border(cht)
+
+            chart_pdf = os.path.join(tmpdir, "chart_%02d.pdf" % n)
+            try:
+                cht.ExportAsFixedFormat(0, chart_pdf, 0, True, False)
+            except Exception as e:
+                raise RuntimeError(
+                    "导出图表 PDF 失败（%s）：\n%s" % (label, e)
+                )
+            if not os.path.isfile(chart_pdf):
+                raise RuntimeError("图表 PDF 未生成（%s）" % label)
+            chart_pdfs.append(chart_pdf)
+
+            if progress_cb:
+                progress_cb(n, total, "已完成：%s" % label)
+
+        _remove_old_pdf(pdf_path)
+
+        # 用 pypdf 把各图表 PDF 拼到 A4 横向页面上（保持矢量）
+        page_w, page_h = landscape(A4)  # 841.89 x 595.28 pt
+        writer = PdfWriter()
+        for chart_pdf in chart_pdfs:
+            reader = PdfReader(chart_pdf)
+            if len(reader.pages) == 0:
+                continue
+            chart_page = reader.pages[0]
+            cw = float(chart_page.mediabox.width)
+            ch = float(chart_page.mediabox.height)
+            if cw <= 0 or ch <= 0:
+                continue
+            # 按原比例放大到填满可用区域并居中，绝不拉伸变形
+            scale = min(PAGE_W / cw, PAGE_H / ch)
+            new_page = writer.add_blank_page(width=page_w, height=page_h)
+            tx = MARGIN_PT + (PAGE_W - cw * scale) / 2.0
+            ty = MARGIN_PT + (PAGE_H - ch * scale) / 2.0
+            t = Transformation().scale(scale).translate(tx, ty)
+            new_page.merge_transformed_page(chart_page, t)
+        writer.add_metadata({"/Title": os.path.basename(pdf_path)})
+        with open(pdf_path, "wb") as f:
+            writer.write(f)
+
+        if not os.path.isfile(pdf_path):
+            raise RuntimeError("PDF 未生成，未知原因。请检查 Excel 是否正常。")
+    finally:
+        for p in chart_pdfs:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+
+def _export_vector_tempwb(excel, wb_src, jobs, pdf_path,
+                          progress_cb=None, log_cb=None):
+    """矢量导出（第二选择，v14 办法）：把活图表复制到临时工作簿，
+    用页面缩放填满 A4，再用 Excel 自带的 ExportAsFixedFormat 导出矢量 PDF。
 
     全程不改图表对象尺寸，放大靠 PageSetup.Zoom，比例不会变形。
-    成功返回 None；失败抛异常（由调用方决定是否退回 PNG 办法）。
+    成功返回 None；失败抛异常。
     """
     total = len(jobs)
     wb_tmp = None
@@ -125,8 +219,6 @@ def _export_vector(excel, wb_src, jobs, pdf_path,
             _hide_chart_border(co.Chart)
 
             # 复制活图表（不是图片），粘贴到临时表里。
-            # 数据表是图表的一部分，跟着图表一起过去；
-            # 数据表数字按原格式显示（比如 21.0，不会变成 21.0072212）。
             co.Copy()
             ws_tmp.Activate()
             ws_tmp.Paste()
@@ -139,7 +231,6 @@ def _export_vector(excel, wb_src, jobs, pdf_path,
                 pass
 
             # 页面缩放：按原比例放大到填满 A4 可用区域。
-            # 这是打印时的缩放，不动图表对象，所以不会变形。
             ow = float(pasted.Width)
             oh = float(pasted.Height)
             if ow > 0 and oh > 0:
@@ -171,15 +262,7 @@ def _export_vector(excel, wb_src, jobs, pdf_path,
             if progress_cb:
                 progress_cb(n, total, "已完成：%s" % label)
 
-        # 旧 PDF 先删掉，避免覆盖失败
-        if os.path.exists(pdf_path):
-            try:
-                os.remove(pdf_path)
-            except OSError:
-                raise RuntimeError(
-                    "无法覆盖旧的 PDF：\n%s\n"
-                    "可能它正被 PDF 阅读器打开着，请关闭后重试。" % pdf_path
-                )
+        _remove_old_pdf(pdf_path)
 
         # 导出整个临时工作簿为 PDF（矢量，和原生打印一样清楚）
         wb_tmp.ExportAsFixedFormat(0, pdf_path, 0, True, False)
@@ -250,14 +333,7 @@ def _export_png(excel, wb_src, jobs, pdf_path, tmpdir,
             if progress_cb:
                 progress_cb(n, total, "已完成：%s" % label)
 
-        if os.path.exists(pdf_path):
-            try:
-                os.remove(pdf_path)
-            except OSError:
-                raise RuntimeError(
-                    "无法覆盖旧的 PDF：\n%s\n"
-                    "可能它正被 PDF 阅读器打开着，请关闭后重试。" % pdf_path
-                )
+        _remove_old_pdf(pdf_path)
 
         c = pdf_canvas.Canvas(pdf_path, pagesize=landscape(A4))
         c.setTitle(os.path.basename(pdf_path))
@@ -290,8 +366,8 @@ def _export_png(excel, wb_src, jobs, pdf_path, tmpdir,
 def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
     """把文件中所有 Sheet 的图表导出为一个 PDF（按 Sheet 顺序，只含图表）。
 
-    先试矢量导出（和原生打印一样清楚）；失败则退回 PNG 办法。
-    返回 (pdf_path, warnings)。
+    依次尝试：直接矢量导出 → 临时工作簿矢量导出 → PNG 办法。
+    返回 (pdf_path, warnings, method)，method 为 "矢量" 或 "图片"。
     """
     try:
         import win32com.client as win32
@@ -337,19 +413,32 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
             raise ValueError("文件中没有找到任何图表，无法导出。")
 
         warnings = []
+        # 1) 直接矢量导出（主办法）
         try:
-            _export_vector(excel, wb, jobs, pdf_path,
-                           progress_cb=progress_cb, log_cb=log_cb)
+            _export_vector_direct(excel, wb, jobs, pdf_path, tmpdir,
+                                  progress_cb=progress_cb, log_cb=log_cb)
+            return pdf_path, warnings, "矢量"
         except Exception as e:
-            # 矢量导出失败，退回 PNG 办法（比例对、但没矢量清楚）
-            warnings.append(
-                "矢量导出失败，已改用图片方式导出，清晰度会差一些。原因：%s" % e)
+            warnings.append("直接矢量导出失败：%s" % e)
             if log_cb:
-                log_cb("矢量导出失败，改用图片方式：%s" % e)
-            _export_png(excel, wb, jobs, pdf_path, tmpdir,
-                        progress_cb=progress_cb, log_cb=log_cb)
+                log_cb("直接矢量导出失败：%s" % e)
 
-        return pdf_path, warnings
+        # 2) 临时工作簿矢量导出（v14 办法）
+        try:
+            _export_vector_tempwb(excel, wb, jobs, pdf_path,
+                                  progress_cb=progress_cb, log_cb=log_cb)
+            return pdf_path, warnings, "矢量"
+        except Exception as e:
+            warnings.append("临时工作簿矢量导出失败：%s" % e)
+            if log_cb:
+                log_cb("临时工作簿矢量导出失败：%s" % e)
+
+        # 3) PNG 办法兜底（比例对、但没矢量清楚）
+        _export_png(excel, wb, jobs, pdf_path, tmpdir,
+                    progress_cb=progress_cb, log_cb=log_cb)
+        warnings.append("两条矢量路都失败了，已改用图片方式导出，"
+                        "清晰度会比原生打印差。")
+        return pdf_path, warnings, "图片"
 
     finally:
         try:
@@ -444,9 +533,9 @@ class App:
                 self.q.put(("log", text))
 
             try:
-                pdf_path, warnings = export_charts_to_pdf(
+                pdf_path, warnings, method = export_charts_to_pdf(
                     excel_path, progress_cb=progress_cb, log_cb=log_cb)
-                self.q.put(("done", pdf_path, warnings))
+                self.q.put(("done", pdf_path, warnings, method))
             except Exception as e:
                 self.q.put(("error", str(e)))
 
@@ -466,8 +555,8 @@ class App:
                 elif kind == "log":
                     self.append_log(item[1])
                 elif kind == "done":
-                    _, pdf_path, warnings = item
-                    self.finish_success(pdf_path, warnings)
+                    _, pdf_path, warnings, method = item
+                    self.finish_success(pdf_path, warnings, method)
                     return
                 elif kind == "error":
                     self.finish_error(item[1])
@@ -477,12 +566,22 @@ class App:
         if self.exporting:
             self.root.after(100, self.poll_queue)
 
-    def finish_success(self, pdf_path, warnings):
+    def finish_success(self, pdf_path, warnings, method):
         self.exporting = False
         self.btn_export.configure(state="normal")
         self.progress["value"] = 100
         self.last_pdf = pdf_path
-        self.status_var.set("导出成功：%s" % os.path.basename(pdf_path))
+        # 让用户一眼看出走的是哪条路：矢量才和原生打印一样清楚；
+        # 如果退回图片方式，必须明说，不然用户拿到糊图还以为矢量没起作用。
+        if method == "矢量":
+            self.status_var.set("导出成功（矢量，和原生打印一样清楚）：%s"
+                                % os.path.basename(pdf_path))
+        else:
+            self.status_var.set("导出成功（图片方式，清晰度一般）：%s"
+                                % os.path.basename(pdf_path))
+            messagebox.showwarning("已用图片方式导出",
+                                   "两条矢量导出都失败了，已改用图片方式导出，"
+                                   "清晰度会比原生打印差。\n\n" + "\n".join(warnings))
         self.append_log("导出成功：%s" % pdf_path)
         for w in warnings:
             self.append_log("提示：" + w)
