@@ -16,13 +16,14 @@ Excel 图表批量导出 PDF 工具
   * 不用 Excel 自带的 PDF 导出（实测 Workbook.ExportAsFixedFormat 在 COM
     调用下反复报“无法保存该文档”；Chart.ExportAsFixedFormat 则会把整个
     工作表含单元格都导出来）。
-  * 用 Chart.Export 把图表单独存为高清 PNG 图片（图表 + 自带的数据表，
-    不含工作表单元格），再用 reportlab 把图片拼成 PDF，每张图一页、
-    A4 横向、按原比例放大居中。Chart.Export 是按屏幕显示渲染的，数据表里
-    的数字按原格式显示（比如 21.0，不会变成 21.0072212）。
+  * 用 Chart.Export 把图表按原尺寸单独存为 PNG 图片（图表 + 自带的数据表，
+    不含工作表单元格），再用 PIL 放大 2 倍，最后用 reportlab 把图片拼成
+    PDF，每张图一页、A4 横向、按原比例放大居中。Chart.Export 是按屏幕显示
+    渲染的，数据表里的数字按原格式显示（比如 21.0，不会变成 21.0072212）。
+    注意：不要去改图表对象的宽高来放大，那会把比例拉变形。
 
 运行环境：Windows + Python 3 + Microsoft Excel
-依赖：pywin32、reportlab（只需装一次：pip install pywin32 reportlab）
+依赖：pywin32、reportlab、pillow（只需装一次：pip install pywin32 reportlab pillow）
 界面：tkinter（Python 自带）
 
 用法：双击运行本文件，或 python excel_chart_to_pdf.py
@@ -39,7 +40,7 @@ from tkinter import filedialog, messagebox, ttk
 
 EXCEL_EXTS = (".xlsx", ".xlsm", ".xls")
 
-VERSION = "v10"
+VERSION = "v11"
 
 # A4 横向可用区域（单位：点 pt；1cm = 28.35pt）
 # A4 横向 29.7cm x 21cm，上下左右各留 1cm 边距
@@ -48,9 +49,9 @@ PAGE_W = 785.0
 PAGE_H = 539.0
 MARGIN_PT = 28.35  # 1cm
 
-# 导出 PNG 时把图表放大的倍数（相对填满 A4 的尺寸），保证图片够清晰
-# 1.5 倍在 A4 打印时约 144 DPI，清晰够用；再大只会白白占内存
-EXPORT_SCALE = 1.5
+# 导出 PNG 后用 PIL 放大的倍数（只改图片像素，不改比例），保证打印清晰
+# 2 倍在 A4 打印时约 100 DPI 以上，够用；再大只会白白占内存
+EXPORT_SCALE = 2.0
 
 
 # ------------------------------------------------------------------
@@ -153,19 +154,7 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
             # 注意：这里不用 CopyPicture，Chart.Export 是按屏幕显示渲染的，
             # 数据表里的数字会按原格式显示（比如 21.0，不会变成 21.0072212）
 
-            # 临时放大图表，保证导出的 PNG 够清晰，导出完恢复
-            ow = float(co.Width)
-            oh = float(co.Height)
-            scaled = False
-            if ow > 0 and oh > 0:
-                fill = min(PAGE_W / ow, PAGE_H / oh)
-                nw = ow * fill * EXPORT_SCALE
-                nh = oh * fill * EXPORT_SCALE
-                co.Width = nw
-                co.Height = nh
-                scaled = True
-
-            # 去掉图表外框的黑边：ChartArea 默认带边框，放大导出后会变成很粗的黑框
+            # 去掉图表外框的黑边：ChartArea 默认带边框，导出后会变成黑框
             try:
                 cht.ChartArea.Format.Line.Visible = 0  # msoFalse，隐藏边框
             except Exception:
@@ -174,7 +163,8 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
                 except Exception:
                     pass
 
-            # 把图表单独存为 PNG（图表 + 自带的数据表，不含工作表单元格）
+            # 按原尺寸导出 PNG，不改图表对象的宽高（直接改宽高会把比例拉变形，
+            # 这就是之前导出的图被纵向拉长的原因）。原图比例就是 Excel 里的比例。
             png_path = os.path.join(tmpdir, "chart_%02d.png" % n)
             try:
                 cht.Export(png_path, "PNG")
@@ -182,15 +172,18 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
                 raise RuntimeError(
                     "导出图表图片失败（%s）：\n%s" % (label, e)
                 )
+            # 原图分辨率不高，用 PIL 放大（LANCZOS），打印更清晰；
+            # 只改图片像素，不改比例。PIL 不可用时直接用原图。
+            try:
+                from PIL import Image
+                im = Image.open(png_path)
+                w0, h0 = im.size
+                if w0 > 0 and h0 > 0:
+                    im.resize((int(w0 * EXPORT_SCALE), int(h0 * EXPORT_SCALE)),
+                              Image.LANCZOS).save(png_path)
+            except Exception:
+                pass
             pngs.append(png_path)
-
-            # 恢复图表原始大小（源文件是只读打开的，本来也不会保存）
-            if scaled:
-                try:
-                    co.Width = ow
-                    co.Height = oh
-                except Exception:
-                    pass
 
             if progress_cb:
                 progress_cb(n, total, "已完成：%s" % label)
@@ -262,7 +255,7 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("Excel 图表批量导出 PDF  " + VERSION)
-        root.geometry("560x190")
+        root.geometry("500x210")
         root.resizable(False, False)
 
         self.file_var = tk.StringVar()
