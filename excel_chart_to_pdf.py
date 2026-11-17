@@ -22,12 +22,11 @@ Excel 图表批量导出 PDF 工具
     的数字按原格式显示（比如 21.0，不会变成 21.0072212）。
 
 运行环境：Windows + Python 3 + Microsoft Excel
-依赖：pywin32、reportlab、windnd（只需装一次：pip install pywin32 reportlab windnd）
+依赖：pywin32、reportlab（只需装一次：pip install pywin32 reportlab）
 界面：tkinter（Python 自带）
 
 用法：双击运行本文件，或 python excel_chart_to_pdf.py
-选文件方式：点「浏览…」，或直接把 Excel 文件拖到本窗口里（拖进来就自动开始导出）；
-也可以把 Excel 文件拖到 exe 图标上启动，会自动载入并导出。
+选文件方式：点「浏览…」选一个 Excel 文件，再点「导出图表 PDF」。
 """
 
 import os
@@ -38,14 +37,9 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-try:
-    import windnd  # Windows 拖放支持（拖文件进窗口）
-except ImportError:
-    windnd = None
-
 EXCEL_EXTS = (".xlsx", ".xlsm", ".xls")
 
-VERSION = "v9"
+VERSION = "v10"
 
 # A4 横向可用区域（单位：点 pt；1cm = 28.35pt）
 # A4 横向 29.7cm x 21cm，上下左右各留 1cm 边距
@@ -268,7 +262,7 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("Excel 图表批量导出 PDF  " + VERSION)
-        root.geometry("560x340")
+        root.geometry("560x190")
         root.resizable(False, False)
 
         self.file_var = tk.StringVar()
@@ -285,25 +279,6 @@ class App:
         ttk.Button(frm_file, text="浏览…", command=self.browse).pack(
             side="left", padx=(8, 0))
 
-        # --- 说明 ---
-        frm_info = ttk.Frame(root, padding=(12, 2))
-        frm_info.pack(fill="x")
-        ttk.Label(
-            frm_info,
-            text="导出整个图表（图 + 自带的数据表 + 图例），不要工作表单元格；按 Sheet 顺序排列，每个图表单独占一页，比例和 Excel 里一模一样。",
-            foreground="#666666",
-            wraplength=520,
-            justify="left",
-        ).pack(anchor="w")
-        self.drop_hint = ttk.Label(
-            frm_info,
-            text="也可以把 Excel 文件直接拖到这个窗口里，松手就自动导出。",
-            foreground="#2B4FD9",
-            wraplength=520,
-            justify="left",
-        )
-        self.drop_hint.pack(anchor="w")
-
         # --- 导出按钮 + 进度 ---
         frm_run = ttk.Frame(root, padding=10)
         frm_run.pack(fill="x", padx=12, pady=6)
@@ -315,31 +290,9 @@ class App:
         self.progress.pack(fill="x", pady=(10, 4))
         ttk.Label(frm_run, textvariable=self.status_var).pack(anchor="w")
 
-        # --- 日志 ---
-        frm_log = ttk.LabelFrame(root, text="日志", padding=10)
-        frm_log.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-        self.log = tk.Text(frm_log, height=5, state="disabled")
-        self.log.pack(fill="both", expand=True)
-
-        # --- 拖入文件支持（windnd）---
-        if windnd is not None:
-            try:
-                windnd.hook_dropfiles(self.root, self._on_drop_raw)
-            except Exception:
-                self.drop_hint.configure(
-                    text="拖放功能不可用（windnd 加载失败），请用「浏览…」选文件。",
-                    foreground="#999999")
-        else:
-            self.drop_hint.configure(
-                text="拖放功能不可用（缺少 windnd），请用「浏览…」选文件；要启用拖放请装一次：pip install windnd。",
-                foreground="#999999")
-
     # -- 小工具 --
     def append_log(self, text):
-        self.log.configure(state="normal")
-        self.log.insert("end", text + "\n")
-        self.log.see("end")
-        self.log.configure(state="disabled")
+        pass  # 日志显示已去掉，只留状态栏
 
     def browse(self):
         path = filedialog.askopenfilename(
@@ -350,61 +303,6 @@ class App:
         if path:
             self.file_var.set(path)
             self.status_var.set("已选择：%s" % os.path.basename(path))
-
-    # -- 拖入文件 --
-    def _on_drop_raw(self, paths):
-        # windnd 在窗口消息里回调：这里绝不能抛异常（否则整个程序闪退），
-        # 只把路径转成 str 后交给 after 回到 tkinter 主循环再处理。
-        try:
-            clean = []
-            for p in (paths or []):
-                if isinstance(p, bytes):
-                    try:
-                        p = os.fsdecode(p)
-                    except Exception:
-                        continue
-                if isinstance(p, str):
-                    clean.append(p)
-            self.root.after(0, lambda ps=tuple(clean): self._handle_drop(ps))
-        except Exception:
-            pass
-
-    def _handle_drop(self, paths):
-        # 主循环里处理，同样包一层，拖入出错只记日志、不闪退
-        try:
-            self._handle_drop_inner(paths)
-        except Exception as e:
-            self.append_log("拖入处理失败：%s" % e)
-
-    def _handle_drop_inner(self, paths):
-        if self.exporting:
-            self.append_log("正在导出，刚才拖入的文件已忽略，请等这次导完再拖。")
-            return
-        if not paths:
-            return
-        # 只取第一个 Excel 文件；多拖了就提示一声
-        excel_path = None
-        for p in paths:
-            if os.path.isfile(p) and os.path.splitext(p)[1].lower() in EXCEL_EXTS:
-                excel_path = p
-                break
-        if excel_path is None:
-            messagebox.showwarning(
-                "不是 Excel 文件",
-                "拖入的文件里没有 .xlsx / .xlsm / .xls，请拖 Excel 文件。")
-            return
-        if len(paths) > 1:
-            self.append_log("拖入了 %d 个文件，只处理第一个 Excel 文件：%s"
-                            % (len(paths), os.path.basename(excel_path)))
-        self.load_file(excel_path, auto_start=True)
-
-    def load_file(self, path, auto_start=False):
-        """填入一个文件路径；auto_start 为真时直接开始导出。"""
-        self.file_var.set(path)
-        self.status_var.set("已选择：%s" % os.path.basename(path))
-        self.append_log("已载入：%s" % path)
-        if auto_start:
-            self.start_export()
 
     # -- 导出流程（后台线程 + 队列回主线程更新界面）--
     def start_export(self):
@@ -488,15 +386,6 @@ class App:
 def main():
     root = tk.Tk()
     app = App(root)
-    app.append_log("Excel 图表批量导出 PDF  " + VERSION
-                   + "（图表按原比例导出，不拉伸；含数据表）")
-    # 把 Excel 文件拖到 exe 图标上启动时，Windows 会把文件路径当作命令行参数传进来
-    if len(sys.argv) > 1:
-        arg = sys.argv[1]
-        if os.path.isfile(arg) and os.path.splitext(arg)[1].lower() in EXCEL_EXTS:
-            app.load_file(arg, auto_start=True)
-        else:
-            app.append_log("启动参数不是 Excel 文件，已忽略：%s" % arg)
     root.mainloop()
 
 
