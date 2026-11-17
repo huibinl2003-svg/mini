@@ -20,9 +20,9 @@ Excel 图表批量导出 PDF 工具
     不含工作表单元格），再用 reportlab 把图片拼成 PDF，每张图一页、
     A4 横向、按原比例放大居中。Chart.Export 是按屏幕显示渲染的，数据表里
     的数字按原格式显示（比如 21.0，不会变成 21.0072212）。
-    导出前先把图表对象放大以提高清晰度：先锁定纵横比再改宽度，高度自动
-    按比例变，导完读回尺寸确认比例没变形才用；一旦比例变了就恢复原尺寸
-    导出（再用 PIL 放大像素兜底）。直接改宽高不锁定纵横比会把图拉变形。
+    导出前不要去动图表对象的尺寸（直接改宽高会拉变形，锁定纵横比再改
+    也会变，v5–v12 都试过了）。按原尺寸导出，比例一定是对的；清晰度靠
+    事后把图片像素放大 3 倍 + 锐化来补，只改像素、不改比例。
 
 运行环境：Windows + Python 3 + Microsoft Excel
 依赖：pywin32、reportlab、pillow（只需装一次：pip install pywin32 reportlab pillow）
@@ -42,7 +42,7 @@ from tkinter import filedialog, messagebox, ttk
 
 EXCEL_EXTS = (".xlsx", ".xlsm", ".xls")
 
-VERSION = "v12"
+VERSION = "v13"
 
 # A4 横向可用区域（单位：点 pt；1cm = 28.35pt）
 # A4 横向 29.7cm x 21cm，上下左右各留 1cm 边距
@@ -51,9 +51,8 @@ PAGE_W = 785.0
 PAGE_H = 539.0
 MARGIN_PT = 28.35  # 1cm
 
-# 临时放大图表对象的倍数（相对填满 A4 的尺寸），导出高清 PNG 用；
-# 放大时先锁定纵横比，只改宽度，高度自动按比例变，保证不变形
-EXPORT_SCALE = 2.0
+# 图片像素放大倍数（PIL 用，只改像素、不改比例）
+EXPORT_SCALE = 3.0
 
 
 # ------------------------------------------------------------------
@@ -156,42 +155,11 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
             # 注意：这里不用 CopyPicture，Chart.Export 是按屏幕显示渲染的，
             # 数据表里的数字会按原格式显示（比如 21.0，不会变成 21.0072212）
 
-            # 临时放大图表以提高清晰度：先锁定纵横比，只改宽度，高度自动按比例变，
-            # 保证不变形；导完恢复原尺寸。v11 不改尺寸所以比例对但图糊，
-            # 这里用锁定纵横比的方式放大，既清晰又不变形。
+            # 不改图表对象的尺寸（v5–v10 直接改宽高会拉变形，v12 锁定纵横比
+            # 再改宽度反而又变宽了）。按原尺寸导出，比例一定是对的；
+            # 清晰度靠后面把图片像素放大 + 锐化来补。
             ow = float(co.Width)
             oh = float(co.Height)
-            scaled = False
-            if ow > 0 and oh > 0:
-                fill = min(PAGE_W / ow, PAGE_H / oh)
-                target_w = ow * fill * EXPORT_SCALE
-                try:
-                    co.ShapeRange.LockAspectRatio = 1  # msoTrue，锁定纵横比
-                except Exception:
-                    pass
-                try:
-                    co.Width = target_w
-                except Exception:
-                    pass
-                # 读回实际尺寸，确认比例没被拉变形
-                try:
-                    nw2 = float(co.Width)
-                    nh2 = float(co.Height)
-                    if nw2 > 0 and nh2 > 0:
-                        r0 = ow / oh
-                        r1 = nw2 / nh2
-                        if abs(r1 - r0) / r0 < 0.01:
-                            scaled = True
-                        else:
-                            # 比例变了，恢复原尺寸，按原尺寸导出
-                            try:
-                                co.Width = ow
-                                co.Height = oh
-                            except Exception:
-                                pass
-                            scaled = False
-                except Exception:
-                    pass
 
             # 去掉图表外框的黑边：ChartArea 默认带边框，导出后会变成黑框
             try:
@@ -202,7 +170,7 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
                 except Exception:
                     pass
 
-            # 按当前尺寸导出 PNG（图表 + 自带的数据表，不含工作表单元格）
+            # 按原尺寸导出 PNG（图表 + 自带的数据表，不含工作表单元格）
             png_path = os.path.join(tmpdir, "chart_%02d.png" % n)
             try:
                 cht.Export(png_path, "PNG")
@@ -211,26 +179,18 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
                     "导出图表图片失败（%s）：\n%s" % (label, e)
                 )
 
-            # 恢复图表原始大小和纵横比锁定（源文件是只读打开的，本来也不会保存）
-            if scaled:
-                try:
-                    co.ShapeRange.LockAspectRatio = 0  # msoFalse，解除锁定
-                except Exception:
-                    pass
-                try:
-                    co.Width = ow
-                    co.Height = oh
-                except Exception:
-                    pass
-
-            # 如果没能放大（回落到原尺寸），原图分辨率低，用 PIL 放大 2 倍
-            # （LANCZOS），只改像素、不改比例，让图清楚一点。
+            # 原图分辨率低（约 96 DPI），用 PIL 放大（LANCZOS）再锐化，
+            # 只改像素、不改比例。PIL 不可用时直接用原图。
             try:
-                from PIL import Image
+                from PIL import Image, ImageFilter
                 im = Image.open(png_path)
                 w0, h0 = im.size
-                if w0 > 0 and h0 > 0 and w0 < 1600:
-                    im.resize((w0 * 2, h0 * 2), Image.LANCZOS).save(png_path)
+                if w0 > 0 and h0 > 0:
+                    im = im.resize((int(w0 * EXPORT_SCALE),
+                                    int(h0 * EXPORT_SCALE)), Image.LANCZOS)
+                    im = im.filter(ImageFilter.UnsharpMask(
+                        radius=2, percent=120, threshold=2))
+                    im.save(png_path)
             except Exception:
                 pass
             pngs.append(png_path)
