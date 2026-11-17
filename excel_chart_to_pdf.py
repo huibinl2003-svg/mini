@@ -8,7 +8,7 @@ Excel 图表批量导出 PDF 工具
   * 导出整个图表：图 + 图表自带的数据表 + 图例，一个都不少；
     但不要工作表的单元格（不要表格）
   * 每个图表单独占 PDF 一页，按 Sheet 顺序排列
-  * A4 横向，图表拉伸铺满整页，打印清晰
+  * A4 横向，图表按原比例放大居中，绝不拉伸变形，效果和 Excel 里看到的一模一样
   * 调用本机 Microsoft Excel 渲染图表（标题、图例、坐标轴、数据标签、颜色、字体与原文件一致）
   * 不修改原始 Excel 文件，不联网
 
@@ -18,7 +18,7 @@ Excel 图表批量导出 PDF 工具
     工作表含单元格都导出来）。
   * 用 Chart.Export 把图表单独存为高清 PNG 图片（图表 + 自带的数据表，
     不含工作表单元格），再用 reportlab 把图片拼成 PDF，每张图一页、
-    A4 横向、拉伸铺满整页。Chart.Export 是按屏幕显示渲染的，数据表里
+    A4 横向、按原比例放大居中。Chart.Export 是按屏幕显示渲染的，数据表里
     的数字按原格式显示（比如 21.0，不会变成 21.0072212）。
 
 运行环境：Windows + Python 3 + Microsoft Excel
@@ -45,6 +45,8 @@ except ImportError:
 
 EXCEL_EXTS = (".xlsx", ".xlsm", ".xls")
 
+VERSION = "v8"
+
 # A4 横向可用区域（单位：点 pt；1cm = 28.35pt）
 # A4 横向 29.7cm x 21cm，上下左右各留 1cm 边距
 # 可用宽 = 27.7cm = 785pt，可用高 = 19cm = 539pt
@@ -53,7 +55,8 @@ PAGE_H = 539.0
 MARGIN_PT = 28.35  # 1cm
 
 # 导出 PNG 时把图表放大的倍数（相对填满 A4 的尺寸），保证图片够清晰
-EXPORT_SCALE = 2.0
+# 1.5 倍在 A4 打印时约 144 DPI，清晰够用；再大只会白白占内存
+EXPORT_SCALE = 1.5
 
 
 # ------------------------------------------------------------------
@@ -249,22 +252,13 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
             pass
 
 
-def open_folder(path):
-    """在资源管理器中打开 path 所在文件夹（Windows）。"""
-    if sys.platform.startswith("win"):
-        try:
-            os.startfile(os.path.dirname(path))
-        except Exception:
-            os.startfile(path)
-
-
 # ------------------------------------------------------------------
 # GUI
 # ------------------------------------------------------------------
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("Excel 图表批量导出 PDF")
+        root.title("Excel 图表批量导出 PDF  " + VERSION)
         root.geometry("560x340")
         root.resizable(False, False)
 
@@ -287,7 +281,7 @@ class App:
         frm_info.pack(fill="x")
         ttk.Label(
             frm_info,
-            text="只导出文件中所有 Sheet 的图表（不要数据表、不要单元格），按 Sheet 顺序排列，每个图表单独占一页。",
+            text="导出整个图表（图 + 自带的数据表 + 图例），不要工作表单元格；按 Sheet 顺序排列，每个图表单独占一页，比例和 Excel 里一模一样。",
             foreground="#666666",
             wraplength=520,
             justify="left",
@@ -350,10 +344,30 @@ class App:
 
     # -- 拖入文件 --
     def _on_drop_raw(self, paths):
-        # windnd 在窗口消息里回调，用 after 回到 tkinter 主循环再处理，避免重入
-        self.root.after(0, lambda: self._handle_drop(paths))
+        # windnd 在窗口消息里回调：这里绝不能抛异常（否则整个程序闪退），
+        # 只把路径转成 str 后交给 after 回到 tkinter 主循环再处理。
+        try:
+            clean = []
+            for p in (paths or []):
+                if isinstance(p, bytes):
+                    try:
+                        p = os.fsdecode(p)
+                    except Exception:
+                        continue
+                if isinstance(p, str):
+                    clean.append(p)
+            self.root.after(0, lambda ps=tuple(clean): self._handle_drop(ps))
+        except Exception:
+            pass
 
     def _handle_drop(self, paths):
+        # 主循环里处理，同样包一层，拖入出错只记日志、不闪退
+        try:
+            self._handle_drop_inner(paths)
+        except Exception as e:
+            self.append_log("拖入处理失败：%s" % e)
+
+    def _handle_drop_inner(self, paths):
         if self.exporting:
             self.append_log("正在导出，刚才拖入的文件已忽略，请等这次导完再拖。")
             return
@@ -451,13 +465,7 @@ class App:
         self.append_log("导出成功：%s" % pdf_path)
         for w in warnings:
             self.append_log("提示：" + w)
-
-        msg = "导出成功！\n\nPDF 已保存到：\n%s" % pdf_path
-        if warnings:
-            msg += "\n\n提示：\n" + "\n".join(warnings)
-        msg += "\n\n是否打开 PDF 所在文件夹？"
-        if messagebox.askyesno("导出成功", msg):
-            open_folder(pdf_path)
+        # 不再弹“是否打开文件夹”的确认框，只在状态栏和日志里给路径
 
     def finish_error(self, err_text):
         self.exporting = False
@@ -471,6 +479,8 @@ class App:
 def main():
     root = tk.Tk()
     app = App(root)
+    app.append_log("Excel 图表批量导出 PDF  " + VERSION
+                   + "（图表按原比例导出，不拉伸；含数据表）")
     # 把 Excel 文件拖到 exe 图标上启动时，Windows 会把文件路径当作命令行参数传进来
     if len(sys.argv) > 1:
         arg = sys.argv[1]
