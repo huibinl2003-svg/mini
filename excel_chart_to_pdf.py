@@ -45,7 +45,7 @@ except ImportError:
 
 EXCEL_EXTS = (".xlsx", ".xlsm", ".xls")
 
-VERSION = "v8"
+VERSION = "v9"
 
 # A4 横向可用区域（单位：点 pt；1cm = 28.35pt）
 # A4 横向 29.7cm x 21cm，上下左右各留 1cm 边距
@@ -170,6 +170,15 @@ def export_charts_to_pdf(excel_path, progress_cb=None, log_cb=None):
                 co.Width = nw
                 co.Height = nh
                 scaled = True
+
+            # 去掉图表外框的黑边：ChartArea 默认带边框，放大导出后会变成很粗的黑框
+            try:
+                cht.ChartArea.Format.Line.Visible = 0  # msoFalse，隐藏边框
+            except Exception:
+                try:
+                    cht.ChartArea.Border.LineStyle = -4142  # xlLineStyleNone
+                except Exception:
+                    pass
 
             # 把图表单独存为 PNG（图表 + 自带的数据表，不含工作表单元格）
             png_path = os.path.join(tmpdir, "chart_%02d.png" % n)
